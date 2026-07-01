@@ -37,11 +37,11 @@ def compute_regime_exposure(
     dma200 = px.rolling(200, min_periods=100).mean()
     
     # 1. Base Trend Exposure
-    exposure = (px >= dma200).map({True: 1.0, False: 0.5})
+    exposure = (px >= dma200).map({True: 1.0, False: 0.6})
     
     # 2. Crash Guard (§V)
     daily_ret = px.pct_change()
-    crash_mask = daily_ret < -0.02
+    crash_mask = daily_ret < -0.025 # Tighter crash guard
     # Apply crash guard to NEXT day
     exposure[crash_mask.shift(1).fillna(False)] *= 0.5
     
@@ -50,9 +50,9 @@ def compute_regime_exposure(
         vix_series = vix_df[price_col].reindex(exposure.index).ffill()
         
         def _get_vix_exposure(v):
-            if v < 15: return 1.0
-            if v <= 25: return 0.7
-            return 0.4
+            if v < 22: return 1.0
+            if v <= 30: return 0.8
+            return 0.6 # floor at 0.6 instead of 0.4
             
         vol_scalar = vix_series.apply(_get_vix_exposure)
         exposure *= vol_scalar

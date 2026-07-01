@@ -13,6 +13,8 @@ Data Integrity:
   - All features lagged 1 day (shift+1) → zero look-ahead
   - context_ret passed externally for Residual Momentum
   - Missing data events are logged
+  i have made the self healing system to heal its pipeline also 
+  
 """
 
 from __future__ import annotations
@@ -117,29 +119,25 @@ def compute_stock_features(
 def post_process_features(panel: pd.DataFrame) -> pd.DataFrame:
     """
     V5 Institutional: Winsorize at 1% tails and Z-score daily.
+    Vectorized replacement for slow groupby.apply structure.
     """
     logger.info("Applying winsorization (1%) and daily Z-scoring...")
     feats = [c for c in FEATURE_COLS if c in panel.columns]
+    processed = panel.copy()
     
-    # Process group by day to maintain cross-sectional integrity
-    def _process_day(df):
-        for col in feats:
-            # Winsorize
-            lower = df[col].quantile(0.01)
-            upper = df[col].quantile(0.99)
-            df[col] = df[col].clip(lower, upper)
-            
-            # Z-Score
-            mu = df[col].mean()
-            sigma = df[col].std()
-            if sigma > 1e-6:
-                df[col] = (df[col] - mu) / sigma
-            else:
-                df[col] = 0.0
-        return df
-
-    # This can be slow, but it's the correct way per mandate
-    processed = panel.groupby("Date", group_keys=False).apply(_process_day)
+    # Process each feature column using vectorized groupby transform for speed
+    for col in feats:
+        # Winsorize: cross-sectional limits per date
+        lower = processed[col].groupby("Date").transform(lambda x: x.quantile(0.01))
+        upper = processed[col].groupby("Date").transform(lambda x: x.quantile(0.99))
+        processed[col] = processed[col].clip(lower, upper)
+        
+        # Z-Score: cross-sectional normalization
+        mu = processed[col].groupby("Date").transform("mean")
+        sigma = processed[col].groupby("Date").transform("std")
+        # Shift sigma slightly to avoid division by zero
+        processed[col] = (processed[col] - mu) / sigma.replace(0, 1e-6)
+        
     return processed
 
 # ════════════════════════════════════════════════════════════════════════
@@ -201,9 +199,19 @@ def drop_highly_correlated_features(panel: pd.DataFrame, threshold: float = 0.6)
     }
     
     feats = [c for c in FEATURE_COLS if c in panel.columns]
-    if len(panel) < 1000: return panel
+    # Filter only features that have at least some data to avoid empty dropna()
+    feats = [c for c in feats if panel[c].notna().any()]
     
-    sample = panel[feats].dropna().sample(min(50_000, len(panel)), random_state=42)
+    if len(panel) < 500 or not feats: 
+        return panel
+    
+    # Only drop rows where these specific features exist
+    available_data = panel[feats].dropna()
+    if len(available_data) == 0:
+        logger.warning("  [Orthogonalization] No rows with complete feature data. Skipping correlation drop.")
+        return panel
+        
+    sample = available_data.sample(min(50_000, len(available_data)), random_state=42)
     corr = sample.corr().abs()
     
     to_drop = set()

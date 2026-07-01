@@ -21,18 +21,18 @@ import xgboost as xgb
 
 logger = logging.getLogger(__name__)
 
-# ── Base hyperparameters (deterministic, conservative) ────────────────────────
+# ── Base hyperparameters (deterministic, slightly more aggressive for alpha) ─────────────
 BASE_PARAMS: Dict[str, Any] = {
     "objective":        "reg:squarederror",
-    "max_depth":        3,            # shallower trees for institutional robustness
-    "learning_rate":    0.03,         # slower, more stable learning
-    "n_estimators":     300,          # more estimators with lower learning rate
-    "min_child_weight": 50,           # significantly higher to prevent outlier-driven leaves
-    "gamma":            5.0,
-    "subsample":        0.7,          # more stochasticity
-    "colsample_bytree": 0.7,
-    "reg_alpha":        1.5,
-    "reg_lambda":       5.0,
+    "max_depth":        4,            # capture more complex non-linear alpha
+    "learning_rate":    0.04,         # slightly faster learning
+    "n_estimators":     400,          # more estimators for deeper signal capture
+    "min_child_weight": 40,           # balanced to prevent noise fitting
+    "gamma":            4.0,          # slightly relaxed regularization
+    "subsample":        0.75,         # bootstrap more data
+    "colsample_bytree": 0.75,
+    "reg_alpha":        1.2,
+    "reg_lambda":       4.0,
     "tree_method":      "hist",
     "random_state":     42,
     "n_jobs":           -1,
@@ -69,19 +69,18 @@ class XGBoostAlphaModel:
         y_train: pd.Series,
         X_val:   Optional[pd.DataFrame] = None,
         y_val:   Optional[pd.Series]    = None,
+        max_healing_rounds: int = 3,
     ) -> Dict[str, float]:
         """
-        Train the model. If X_val/y_val provided:
-          1. Train with base params
-          2. Evaluate IC on both sets
-          3. If overfit_score > 0.05, re-fit ONCE with REGULARIZED_PARAMS (not in a loop)
-        Returns {train_ic, val_ic, overfit_score}.
+        Train the model. If overfitting is detected (score > 0.05),
+        the system engages a Self-Healing loop that recursively 
+        increases regularization and shrinks tree depth until it stabilizes.
         """
         self.features = sorted(X_train.columns.tolist())
         Xtr = X_train[self.features]
 
         # ── Train ─────────────────────────────────────────────────────────────
-        params_to_use = self.params
+        params_to_use = self.params.copy()
         self.model = xgb.XGBRegressor(**params_to_use)
         self.model.fit(Xtr, y_train)
 
@@ -100,19 +99,41 @@ class XGBoostAlphaModel:
                 f"Val IC: {self.val_ic:.4f} | Score: {self.overfit_score:.4f}"
             )
 
-            # ── ONE corrective re-fit (no loop) ───────────────────────────────
-            if self.overfit_score > 0.05:
+            # ── Self-Healing Loop ───────────────────────────────
+            round_idx = 0
+            while self.overfit_score > 0.05 and round_idx < max_healing_rounds:
+                round_idx += 1
                 logger.warning(
-                    f"  [Regularize] Overfit={self.overfit_score:.3f} > 0.05. "
-                    f"Switching to regularized params and re-fitting once."
+                    f"  [Self-Healing {round_idx}/{max_healing_rounds}] Overfit={self.overfit_score:.3f} > 0.05. "
+                    f"Applying dynamic regularization squeeze."
                 )
-                reg_params = {**REGULARIZED_PARAMS, "random_state": params_to_use.get("random_state", 42)}
-                self.model = xgb.XGBRegressor(**reg_params)
+                
+                # Dynamically crush variance
+                params_to_use["max_depth"]  = max(1, params_to_use.get("max_depth", 4) - 1)
+                params_to_use["reg_lambda"] = params_to_use.get("reg_lambda", 4.0) * 1.5
+                params_to_use["reg_alpha"]  = params_to_use.get("reg_alpha", 1.2) * 1.5
+                params_to_use["gamma"]      = params_to_use.get("gamma", 4.0) * 1.5
+                
+                self.model = xgb.XGBRegressor(**params_to_use)
                 self.model.fit(Xtr, y_train)
-                # Re-evaluate after regularization (informational only)
-                val_preds2 = pd.Series(self.model.predict(Xvl), index=Xvl.index)
-                self.val_ic = self._ic(y_val, val_preds2)
-                logger.info(f"  [Regularize] Post-regularization Val IC: {self.val_ic:.4f}")
+                
+                # Re-evaluate
+                train_preds = pd.Series(self.model.predict(Xtr), index=Xtr.index)
+                val_preds   = pd.Series(self.model.predict(Xvl), index=Xvl.index)
+                
+                self.train_ic = self._ic(y_train, train_preds)
+                self.val_ic   = self._ic(y_val,   val_preds)
+                self.overfit_score = self.train_ic - self.val_ic
+                
+                logger.info(
+                    f"  ↳ Post-Heal Train IC: {self.train_ic:.4f} | "
+                    f"Val IC: {self.val_ic:.4f} | Score: {self.overfit_score:.4f}"
+                )
+                
+            if round_idx > 0 and self.overfit_score <= 0.05:
+                logger.info("  ✅ System successfully auto-healed the alpha parameters.")
+            elif round_idx == max_healing_rounds and self.overfit_score > 0.05:
+                logger.warning("  ⚠️ Healer reached max rounds, but overfitting persists. Selected most tightened state.")
 
         return {
             "train_ic":      self.train_ic,
@@ -176,7 +197,7 @@ class EnsembleAlphaModel:
         )
 
         self.models = []
-        train_ics, val_ics = [], []
+        train_ics, val_ics, overfit_scores = [], [], []
         for i in range(self.n_models):
             seed_params = {**self.base_params, "random_state": 42 + i}
             m = XGBoostAlphaModel(params=seed_params)
@@ -184,14 +205,16 @@ class EnsembleAlphaModel:
             self.models.append(m)
             train_ics.append(res.get("train_ic", 0.0))
             val_ics.append(res.get("val_ic", 0.0))
+            overfit_scores.append(res.get("overfit_score", 0.0))
 
         avg_train = float(np.mean(train_ics))
         avg_val   = float(np.mean(val_ics))
+        avg_overfit = float(np.mean(overfit_scores))
         logger.info(
-            f"  [Ensemble Avg] Train IC: {avg_train:.4f} | Val IC: {avg_val:.4f}"
+            f"  [Ensemble Avg] Train IC: {avg_train:.4f} | Val IC: {avg_val:.4f} | Final Overfit: {avg_overfit:.4f}"
         )
 
-        return {"train_ic": avg_train, "val_ic": avg_val}
+        return {"train_ic": avg_train, "val_ic": avg_val, "overfit_score": avg_overfit}
 
     def predict(self, X: pd.DataFrame) -> pd.Series:
         if not self.models:

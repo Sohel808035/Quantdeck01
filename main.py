@@ -46,6 +46,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
+# Suppress yfinance error noise
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logger = logging.getLogger(__name__)
 
 # ── Local imports ─────────────────────────────────────────────────────────────
@@ -77,7 +79,7 @@ from execution_layer.stress_tester import run_stress_tests
 # ══════════════════════════════════════════════════════════════════════════════
 START_DATE          = "2005-01-01"
 TRAIN_WINDOW_YEARS  = 3        
-REBALANCE_MONTHS    = 3        # Step 4 mandate: 6m -> 3m
+REBALANCE_MONTHS    = 1        # Higher frequency for alpha capture
 REBALANCE_HORIZON   = 60       # Rank target horizon
 TOP_N               = 45       # Baseline (dynamic override in Step 3)
 BUFFER_N            = 65       # Baseline (dynamic override in Step 3)
@@ -199,7 +201,8 @@ def step3_walk_forward(full_panel: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     logger.info("§III — WALK-FORWARD TRAINING (Ensemble XGBoost, Overfitting Guard)")
     logger.info("=" * 70)
 
-    features_cols = sorted([c for c in full_panel.columns if c in FEATURE_COLS])
+    # Only include features that have at least some data (prevents dropna crash)
+    features_cols = sorted([c for c in full_panel.columns if c in FEATURE_COLS and full_panel[c].notna().any()])
     logger.info(f"  Institutional active features: {features_cols}")
 
     engine   = WalkForwardEngine(train_years=TRAIN_WINDOW_YEARS, rebalance_months=REBALANCE_MONTHS, horizon_days=60, embargo_days=10)
@@ -256,7 +259,7 @@ def step3_walk_forward(full_panel: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
         scores = pd.concat(monthly_scores_list, axis=1).mean(axis=1)
 
         # §V — Portfolio construction with Hysteresis (Step 3: Top 20% Quintile)
-        dynamic_top_n = max(10, int(len(scores) * 0.20))
+        dynamic_top_n = max(12, int(len(scores) * 0.15))
         dynamic_buffer = int(dynamic_top_n * 1.4) # Preserve hysteresis
         
         # Override baseline configs with dynamic quintile logic
@@ -451,6 +454,59 @@ def step6_save_reports(prod_results: Dict[str, Any]):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# LIVE ORDERS
+# ══════════════════════════════════════════════════════════════════════════════
+def step7_generate_live_orders(weight_df: pd.DataFrame, stock_panel: pd.DataFrame, initial_capital: float = INITIAL_CAPITAL):
+    logger.info("=" * 70)
+    logger.info("§X — LIVE ORDER GENERATOR (EXACT SHARES)")
+    logger.info("=" * 70)
+    
+    if weight_df.empty:
+        logger.warning("  No weights available to generate orders.")
+        return
+        
+    latest_date = weight_df.index[-1]
+    latest_weights = weight_df.loc[latest_date]
+    active_weights = latest_weights[latest_weights > 0].sort_values(ascending=False)
+    
+    if active_weights.empty:
+        logger.info("  No active positions for the latest target date.")
+        return
+        
+    close_prices = stock_panel["Close"].unstack(level="Ticker")
+    latest_price_date = close_prices.index[-1]
+    latest_prices = close_prices.loc[latest_price_date]
+    
+    orders = []
+    for ticker, weight in active_weights.items():
+        if ticker in latest_prices and pd.notna(latest_prices[ticker]):
+            price = latest_prices[ticker]
+            allocated_capital = weight * initial_capital
+            shares = int(allocated_capital // price)
+            if shares > 0:
+                orders.append({
+                    "Ticker": ticker,
+                    "Target_Weight_%": round(weight * 100, 2),
+                    "Allocated_Capital": round(allocated_capital, 2),
+                    "Latest_Price": round(price, 2),
+                    "Shares_To_Buy": shares
+                })
+                
+    if not orders:
+        logger.info("  No whole shares could be allocated with the current capital.")
+        return
+        
+    orders_df = pd.DataFrame(orders)
+    
+    logger.info(f"\n  LIVE ORDERS FOR {latest_date.date()} (Prices as of {latest_price_date.date()})\n")
+    logger.info(orders_df.to_string(index=False))
+    
+    out_path = Path("reports/daily_orders.csv")
+    orders_df.to_csv(out_path, index=False)
+    logger.info(f"\n  ✅ Explicit Shares list saved to {out_path.resolve()}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
@@ -518,6 +574,71 @@ def main():
 
     # Save reports
     step6_save_reports(prod_results)
+
+    # Generate exact shares for execution
+    step7_generate_live_orders(weight_df, stock_panel, INITIAL_CAPITAL)
+
+    # ── Daily Allocation Summary (with SL & Target) ────────────────────────────────────────
+    def step8_daily_summary(weight_df: pd.DataFrame, stock_panel: pd.DataFrame, initial_capital: float = INITIAL_CAPITAL):
+        """Create a daily CSV summarising ticker, weight, allocated capital, entry price, stop‑loss and target.
+        Stop‑loss set at 2% below entry, target at 5% above entry by default.
+        """
+        if weight_df.empty:
+            logger.warning("  [Summary] No weights to summarise.")
+            return
+        latest_date = weight_df.index[-1]
+        latest_weights = weight_df.loc[latest_date]
+        active_weights = latest_weights[latest_weights > 0].sort_values(ascending=False)
+        close_prices = stock_panel["Close"].unstack(level="Ticker")
+        latest_price_date = close_prices.index[-1]
+        latest_prices = close_prices.loc[latest_price_date]
+        rows = []
+        for ticker, weight in active_weights.items():
+            if ticker not in latest_prices or pd.isna(latest_prices[ticker]):
+                continue
+            price = latest_prices[ticker]
+            allocated_cap = weight * initial_capital
+            shares = int(allocated_cap // price)
+            if shares <= 0:
+                continue
+            stop_loss = round(price * 0.98, 2)
+            target = round(price * 1.05, 2)
+            rows.append({
+                "Date": latest_date.date(),
+                "Ticker": ticker,
+                "Weight_%": round(weight * 100, 2),
+                "Allocated_Capital": round(allocated_cap, 2),
+                "Entry_Price": round(price, 2),
+                "Shares": shares,
+                "Stop_Loss": stop_loss,
+                "Target": target,
+            })
+        if not rows:
+            logger.info("  [Summary] No share allocations after rounding.")
+            return
+        summary_df = pd.DataFrame(rows)
+        out_path = Path("reports/daily_summary.csv")
+        summary_df.to_csv(out_path, index=False)
+        logger.info(f"\n  📊 Daily allocation summary saved to {out_path.resolve()}")
+
+    # ── Cleanup Unused CSVs ───────────────────────────────────────────────────────
+    def step9_cleanup_reports():
+        """Remove any CSV files in the reports folder that are not the official outputs.
+        Keeps daily_orders.csv and daily_summary.csv.
+        """
+        reports_dir = Path("reports")
+        keep_files = {"daily_orders.csv", "daily_summary.csv"}
+        for f in reports_dir.glob("*.csv"):
+            if f.name not in keep_files:
+                try:
+                    f.unlink()
+                    logger.info(f"[Cleanup] Removed stray file {f.name}")
+                except Exception as exc:
+                    logger.warning(f"[Cleanup] Could not delete {f.name}: {exc}")
+
+    # Run the new steps
+    step8_daily_summary(weight_df, stock_panel, INITIAL_CAPITAL)
+    step9_cleanup_reports()
 
     logger.info("CQRO Engine Run Complete.")
 

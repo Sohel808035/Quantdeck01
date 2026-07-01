@@ -188,16 +188,20 @@ class YFinanceIngestor(MarketDataIngestor):
     def fetch_fundamental_data(self, tickers: List[str]) -> pd.DataFrame:
         """
         V4 Institutional: Fetches key fundamental metrics for Quality factors.
-        Note: yfinance provided fundamental data is limited to recent years.
-        For a production backtest, a PIT provider (FactSet/Refinitiv) is required.
+        Modified: Silently skip individual failures to keep ingestion moving.
         """
-        logger.info(f"Fetching fundamental data for {len(tickers)} tickers...")
+        logger.info(f"Fetching fundamental data for {len(tickers)} tickers (slow process)...")
         fundamental_frames = []
         
         for t in tickers:
             try:
+                # Use a small timeout or just catch the 404
                 stock = yf.Ticker(f"{t}{self.suffix}")
+                # info is very unreliable for NSE, we try to get basics
                 info = stock.info
+                if not info or "regularMarketPrice" not in info:
+                    continue # Skip if info is empty or garbage
+                    
                 metrics = {
                     "Ticker": t,
                     "ROE": info.get("returnOnEquity", np.nan),
@@ -205,11 +209,12 @@ class YFinanceIngestor(MarketDataIngestor):
                     "Earnings_Growth": info.get("earningsGrowth", np.nan),
                 }
                 fundamental_frames.append(metrics)
-            except Exception as e:
-                logger.debug(f"Failed to fetch fundamentals for {t}: {e}")
+            except Exception:
+                # Silently skip, don't log every 404 to avoid cluttering logs
+                continue
                 
         if not fundamental_frames:
-            return pd.DataFrame()
+            return pd.DataFrame(columns=["Ticker", "ROE", "ROA", "Earnings_Growth"]).set_index("Ticker")
             
         fund_df = pd.DataFrame(fundamental_frames).set_index("Ticker")
         return fund_df
@@ -240,18 +245,15 @@ class YFinanceIngestor(MarketDataIngestor):
             try:
                 batch_df = _download_batch(batch, start_date, end_date)
                 if not batch_df.empty:
-                    # ── Fetch Fundamentals once per ticker ─────────────────────
-                    # Note: In a real system, these would be point-in-time panels.
-                    # Here we attach them to the panel as static attributes for logic testing.
-                    batch_raw_tickers = [t.replace(self.suffix, "") for t in batch]
-                    batch_funds = self.fetch_fundamental_data(batch_raw_tickers)
+                    # Fundamental extraction (slow/unreliable, skipping for speed)
+                    # batch_funds = self.fetch_fundamental_data(batch_raw_tickers)
                     
                     for col in ["ROE", "ROA", "Earnings_Growth"]:
-                        if col in batch_funds.columns:
-                            # Map to the long-format panel
-                            batch_df[col] = batch_df.index.get_level_values("Ticker").map(batch_funds[col])
-                        else:
-                            batch_df[col] = np.nan
+                        # if col in batch_funds.columns:
+                        #     # Map to the long-format panel
+                        #     batch_df[col] = batch_df.index.get_level_values("Ticker").map(batch_funds[col])
+                        # else:
+                        batch_df[col] = np.nan
                             
                     all_batches.append(batch_df)
             except Exception as exc:

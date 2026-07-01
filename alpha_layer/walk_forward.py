@@ -50,34 +50,38 @@ class WalkForwardEngine:
     ) -> Generator[Tuple[pd.DataFrame, pd.Timestamp], None, None]:
         """
         Institutional Walk-forward (Step 5):
-        - Train window = 3 years (Sliding)
-        - Test/Rebalance window = 6 months
+        - Optimized for speed with vectorized slicing on sorted index.
         """
+        # Ensure panel is sorted by Date level for fast loc slicing
+        if not panel.index.is_monotonic_increasing:
+            panel = panel.sort_index(level="Date")
+            
         dates = panel.index.get_level_values("Date").unique().sort_values()
 
-        # Start after first 3 years
+        # Start after first training period
         start_date = dates[0] + pd.DateOffset(years=self.train_years)
         rebalance_dates = pd.date_range(start=start_date, end=dates[-1], freq=f"{self.rebalance_months}MS")
+        
+        # Snap to actual business dates
         rebalance_dates = [dates[dates >= d][0] for d in rebalance_dates if (dates >= d).any()]
 
         total_purge_days = self.horizon_days + self.embargo_days
 
         for pred_date in rebalance_dates:
-            # ── Sliding Window Filter ────────────────────────────────────────
-            # End of training: pred_date - purge gap
+            # Training cutoff: pred_date - purge gap
             train_end = pred_date - pd.Timedelta(days=total_purge_days)
-            # Start of training: train_end - 3 years
             train_start = train_end - pd.DateOffset(years=self.train_years)
             
-            train_mask = (
-                (panel.index.get_level_values("Date") >= train_start) &
-                (panel.index.get_level_values("Date") <= train_end) &
-                (panel[target_col].notna())
-            )
-            train_slice = panel.loc[train_mask]
-
-            if len(train_slice) < 500: # Threshold for institutional training
-                logger.warning(f"  Insufficient data for {pred_date.date()}, skipping.")
+            # Efficient slice on sorted MultiIndex
+            try:
+                # Use .xs or .loc with slice. Assuming index(Date, Ticker)
+                train_slice = panel.loc[slice(train_start, train_end), :]
+                # Filter for valid targets
+                train_slice = train_slice.dropna(subset=[target_col])
+                
+                if len(train_slice) < 500:
+                    continue
+                    
+                yield train_slice, pred_date
+            except KeyError:
                 continue
-
-            yield train_slice, pred_date
