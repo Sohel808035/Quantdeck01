@@ -22,6 +22,12 @@ from data_layer.universe import (
     get_yfinance_tickers,
     NIFTY200_STATIC_LIST,
 )
+from data_layer.versioning import DatasetVersionManager
+from data_layer.repository import (
+    IMarketDataRepository,
+    ParquetRepository,
+    HybridDataRepository,
+)
 
 __all__ = [
     "DataConfig",
@@ -38,4 +44,8 @@ __all__ = [
     "get_universe",
     "get_yfinance_tickers",
     "NIFTY200_STATIC_LIST",
+    "DatasetVersionManager",
+    "IMarketDataRepository",
+    "ParquetRepository",
+    "HybridDataRepository",
 ]
