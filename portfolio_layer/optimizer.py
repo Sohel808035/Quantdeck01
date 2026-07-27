@@ -1,140 +1,137 @@
 """
-portfolio_layer/optimizer.py  (v2)
-────────────────────────────────────
-Equal weight within selected portfolio: 1/N per stock.
-With top_n = 25 → exactly 4% per position.
+portfolio_layer/optimizer.py  (v3 — Modular Plugin Architecture)
+────────────────────────────────────────────────────────────────
+Backward-compatible wrapper around PortfolioPluginRegistry.
+
+Maintains existing equal_weight(), sector_neutralize(), beta_target(),
+and apply_turnover_penalty() interfaces while enabling plugin execution.
 """
 
 from __future__ import annotations
-
 import logging
-from typing import Set, Optional, Dict
-import pandas as pd  # type: ignore
-import numpy as np  # type: ignore
+from typing import Set, Optional, Dict, Any
+import pandas as pd
+import numpy as np
+
+from portfolio_layer.base import (
+    BasePortfolioPlugin,
+    PortfolioPluginRegistry,
+    PortfolioConstraints,
+)
+from portfolio_layer.constraints import ConstraintsEngine
+from portfolio_layer.rebalancing import RebalancingEngine
+from portfolio_layer.transaction_cost import TransactionCostEngine
+from portfolio_layer.position_sizing import PositionSizingEngine
+
+# Import plugins to force self-registration in registry
+import portfolio_layer.plugins.equal_weight
+import portfolio_layer.plugins.risk_parity
+import portfolio_layer.plugins.hrp
+import portfolio_layer.plugins.min_variance
+import portfolio_layer.plugins.black_litterman
+import portfolio_layer.plugins.kelly
+
+logger = logging.getLogger(__name__)
+
 
 class PortfolioOptimizer:
+    """
+    Modular Portfolio Optimizer supporting dynamic plugin execution,
+    constraints, rebalancing penalties, transaction cost models, and position sizing.
+    """
+
+    def __init__(self, default_optimizer: str = "equal_weight"):
+        self.default_optimizer = default_optimizer
+        self.constraints_engine = ConstraintsEngine()
+        self.rebalancing_engine = RebalancingEngine()
+        self.cost_engine = TransactionCostEngine()
+        self.sizing_engine = PositionSizingEngine()
+
+    def optimize(
+        self,
+        selected_tickers: Set[str],
+        optimizer_name: Optional[str] = None,
+        returns_df: Optional[pd.DataFrame] = None,
+        alpha_scores: Optional[pd.Series] = None,
+        adv_data: Optional[pd.Series] = None,
+        constraints: Optional[PortfolioConstraints] = None,
+        **kwargs,
+    ) -> pd.Series:
+        """
+        Executes the requested optimizer plugin by name.
+
+        Supported Optimizers:
+          - 'equal_weight'    : Equal Weight (1/N)
+          - 'risk_parity'     : Risk Parity / Equal Risk Contribution (ERC)
+          - 'hrp'             : Hierarchical Risk Parity (López de Prado 2016)
+          - 'min_variance'    : Minimum Variance Portfolio
+          - 'black_litterman' : Black-Litterman model
+          - 'kelly'           : Fractional Kelly Criterion
+        """
+        name = optimizer_name or self.default_optimizer
+        plugin = PortfolioPluginRegistry.get(name)
+
+        weights = plugin.optimize(
+            selected_tickers=selected_tickers,
+            returns_df=returns_df,
+            alpha_scores=alpha_scores,
+            adv_data=adv_data,
+            constraints=constraints or self.constraints_engine.constraints,
+            **kwargs,
+        )
+
+        return weights
+
+    # ── Backward-Compatibility Wrappers ───────────────────────────────────────
 
     def equal_weight(
-        self, 
+        self,
         selected_tickers: Set[str],
         adv_data: Optional[pd.Series] = None,
         portfolio_value: float = 1e7,
-        max_adv_pct: float = 0.05
+        max_adv_pct: float = 0.05,
     ) -> pd.Series:
-        """
-        V3 Institutional: Equal weight with ADV constraints.
-        1. Base weight = 1/N.
-        2. Cap each weight at max_adv_pct * ADV / portfolio_value.
-        3. Redistribute residual weight equally.
-        """
-        if not selected_tickers:
-            return pd.Series(dtype=float)
-
-        tickers = sorted(selected_tickers)
-        n = len(tickers)
-        weights = pd.Series(1.0 / n, index=tickers, name="weight")
-
-        if adv_data is not None:
-            # 1. Cap weights by ADV
-            adv_subset = adv_data.reindex(tickers).fillna(0)
-            max_weights = (adv_subset * max_adv_pct) / portfolio_value
-            
-            # 2. Identify capped stocks
-            capped_mask = weights > max_weights
-            if capped_mask.any():
-                weights[capped_mask] = max_weights[capped_mask]
-                
-                # 3. Redistribute remaining weight to uncapped stocks
-                residual = 1.0 - weights.sum()
-                uncapped = ~capped_mask
-                if uncapped.any() and residual > 0.01:
-                    weights[uncapped] += (residual / uncapped.sum())
-        
-        return weights
+        """Backward-compatible equal_weight entry point."""
+        constraints = PortfolioConstraints(
+            portfolio_value=portfolio_value,
+            max_adv_pct=max_adv_pct,
+        )
+        return self.optimize(
+            selected_tickers=selected_tickers,
+            optimizer_name="equal_weight",
+            adv_data=adv_data,
+            constraints=constraints,
+        )
 
     def sector_neutralize(
-        self, 
-        weights: pd.Series, 
-        sector_map: Dict[str, str], 
-        benchmark_weights: Dict[str, float]
+        self,
+        weights: pd.Series,
+        sector_map: Dict[str, str],
+        benchmark_weights: Dict[str, float],
     ) -> pd.Series:
-        """
-        V3 Institutional: Adjusts portfolio weights to match sector exposure.
-        Simple heuristic: scaled to +/- 5% deviation from benchmark.
-        """
-        if weights.empty: return weights
-        
-        df = pd.DataFrame({"weight": weights})
-        df["Sector"] = df.index.map(sector_map).fillna("Other")
-        
-        port_sector_w = df.groupby("Sector")["weight"].sum()
-        
-        # Scaling adjustment
-        for sector, b_weight in benchmark_weights.items():
-            current_w = port_sector_w.get(sector, 0.0)
-            if current_w > 0:
-                # Target: current_w should be within [b-0.05, b+0.05]
-                target_w = max(min(current_w, b_weight + 0.05), b_weight - 0.05)
-                scalar = target_w / current_w
-                df.loc[df["Sector"] == sector, "weight"] *= scalar
-                
-        # Final normalize to 100%
-        result = df["weight"] / df["weight"].sum()
-        return result
+        """Backward-compatible sector_neutralize wrapper."""
+        return self.constraints_engine.sector_neutralize(
+            weights, sector_map, benchmark_weights
+        )
 
     def beta_target(
-        self, 
-        weights: pd.Series, 
-        stock_betas: pd.Series, 
-        target_range: tuple = (0.8, 1.2)
+        self,
+        weights: pd.Series,
+        stock_betas: pd.Series,
+        target_range: tuple = (0.8, 1.2),
     ) -> pd.Series:
-        """
-        V3 Institutional: Rescale weights to keep portfolio beta within range.
-        """
-        if weights.empty or stock_betas.empty: return weights
-        
-        # Align betas
-        betas = stock_betas.reindex(weights.index).fillna(1.0)
-        port_beta = (weights * betas).sum()
-        
-        if port_beta < target_range[0]:
-            scalar = target_range[0] / port_beta
-            return weights * scalar
-        elif port_beta > target_range[1]:
-            scalar = target_range[1] / port_beta
-            return weights * scalar
-        
-        return weights
-    def apply_turnover_penalty(
-        self, 
-        current_weights: pd.Series, 
-        target_weights: pd.Series, 
-        threshold: float = 0.005
-    ) -> pd.Series:
-        """
-        V3 Institutional: Turnover Penalty (No-Trade Zone).
-        If the required change for a stock is < threshold (default 50bps), 
-        keep the current weight to avoid expensive micro-trades.
-        """
-        if current_weights.empty:
-            return target_weights
+        """Backward-compatible beta_target wrapper."""
+        return self.constraints_engine.beta_target(
+            weights, stock_betas, target_range=target_range
+        )
 
-        # Align both series
-        all_tickers = sorted(list(set(current_weights.index) | set(target_weights.index)))
-        curr = current_weights.reindex(all_tickers).fillna(0.0)
-        targ = target_weights.reindex(all_tickers).fillna(0.0)
-        
-        diff = abs(targ - curr)
-        
-        # Only trade if diff > threshold
-        final_weights = curr.copy()
-        trade_mask = diff > threshold
-        final_weights[trade_mask] = targ[trade_mask]
-        
-        # Final normalize to ensure we are still 100% (or less if cash is allowed)
-        # Note: In institutional L/S, normally we'd allow cash. 
-        # Here we re-normalize to maintain exposure.
-        if final_weights.sum() > 0:
-            final_weights = final_weights / final_weights.sum()
-            
-        return final_weights
+    def apply_turnover_penalty(
+        self,
+        current_weights: pd.Series,
+        target_weights: pd.Series,
+        threshold: float = 0.005,
+    ) -> pd.Series:
+        """Backward-compatible apply_turnover_penalty wrapper."""
+        return self.rebalancing_engine.apply_turnover_penalty(
+            current_weights, target_weights, threshold=threshold
+        )
