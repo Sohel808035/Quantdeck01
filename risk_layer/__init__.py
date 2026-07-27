@@ -6,6 +6,7 @@ Preserves existing regime models while providing full institutional risk suite.
 from risk_layer.base import RiskMetricsReport
 from risk_layer.config import RiskConfig
 from risk_layer.engine import InstitutionalRiskEngine
+RiskEngine = InstitutionalRiskEngine
 from risk_layer.var_cvar import VaRCVaREngine
 from risk_layer.stress_testing import StressTestingEngine
 from risk_layer.liquidity_risk import LiquidityRiskEngine
@@ -26,6 +27,7 @@ __all__ = [
     "RiskMetricsReport",
     "RiskConfig",
     "InstitutionalRiskEngine",
+    "RiskEngine",
     "VaRCVaREngine",
     "StressTestingEngine",
     "LiquidityRiskEngine",
