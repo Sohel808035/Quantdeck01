@@ -1,20 +1,26 @@
 """
 data_layer/universe.py
 ──────────────────────
-Manages the investable universe of 200 Indian large/mid-cap stocks.
-Handles Point-In-Time (PIT) membership to eliminate survivorship bias.
+Manages the investable universe of 200 Indian large/mid-cap stocks (NIFTY 200).
+Supports Point-In-Time (PIT) historical membership snapshots to eliminate survivorship bias,
+and provides industry sector mappings and benchmark sector weights.
 """
 
 from __future__ import annotations
+
 import logging
 from pathlib import Path
 from typing import List, Optional, Dict
+
 import numpy as np  # type: ignore
 import pandas as pd  # type: ignore
 
+from data_layer.config import DataConfig
+from data_layer.interfaces import IUniverseProvider
+
 logger = logging.getLogger(__name__)
 
-# Static fallback list (NIFTY 200 constituents as of early 2026)
+# Static fallback list (NIFTY 200 constituents)
 NIFTY200_STATIC_LIST: List[str] = [
     "RELIANCE", "TCS", "HDFCBANK", "INFY", "HINDUNILVR", "ICICIBANK", "KOTAKBANK",
     "AXISBANK", "BAJFINANCE", "BHARTIARTL", "LT", "ASIANPAINT", "MARUTI", "TITAN",
@@ -62,53 +68,56 @@ NIFTY200_STATIC_LIST: List[str] = [
     "VIJAYA", "VSTIND", "WCMCABLE", "WELSPUNLIV", "ZFCVINDIA",
 ]
 
-class UniverseManager:
+
+class UniverseManager(IUniverseProvider):
     """
-    V3 Institutional Universe Management.
-    Supports point-in-time membership and provides sector mapping.
+    QuantSphereX V2 Institutional Universe Manager.
+    Supports Point-In-Time (PIT) membership lookup and industry sector metadata.
     """
-    def __init__(self, membership_path: Optional[str] = None):
-        self.path = Path(membership_path or "data_cache/universe_membership.parquet")
+
+    def __init__(
+        self,
+        membership_path: Optional[str | Path] = None,
+        config: Optional[DataConfig] = None,
+    ):
+        self.config = config or DataConfig()
+        default_path = self.config.cache_dir / "universe_membership.parquet"
+        self.path = Path(membership_path) if membership_path else default_path
         self.history: Optional[pd.DataFrame] = None
-        
+
         if self.path.exists():
             try:
                 self.history = pd.read_parquet(self.path)
-                logger.info(f"[Universe] Loaded historical membership from {self.path}")
-            except Exception as e:
-                logger.error(f"[Universe] Failed to load membership: {e}")
+                logger.info(f"[Universe] Loaded historical PIT membership from {self.path.name}")
+            except Exception as exc:
+                logger.error(f"[Universe] Failed to load PIT membership file ({exc}). Falling back to static list.")
         else:
-            logger.warning("[Universe] Historical membership file NOT found. Falling back to static list. Backtests will have Survivorship Bias.")
+            logger.debug("[Universe] PIT membership file not found. Falling back to static NIFTY 200 list.")
 
     def get_universe(self, date: Optional[pd.Timestamp] = None) -> List[str]:
-        """Returns the list of tickers that were in the NIFTY 200 on a specific date."""
+        """Returns the list of active tickers for a specific historical date."""
         if date is not None and self.history is not None:
             try:
-                # Find the nearest snapshot date <= requested date in the index
                 hist_dates = self.history.index.get_level_values("Date").unique()
                 valid_dates = hist_dates[hist_dates <= pd.to_datetime(date)]
-                
+
                 if not valid_dates.empty:
                     snap_date = valid_dates.max()
-                    # Query membership for that date
                     snap_df = self.history.loc[snap_date]
-                    # Select only active tickers
                     active_tickers = snap_df[snap_df["IsInUniverse"] == True].index.tolist()
-                    
+
                     if active_tickers:
                         return active_tickers
-                    
-            except Exception as e:
-                logger.error(f"[Universe] Error querying membership for {date}: {e}")
-        
-        # Default fallback to static list if date is None or history fails
+            except Exception as exc:
+                logger.error(f"[Universe] Error querying PIT membership for {date}: {exc}")
+
         return list(NIFTY200_STATIC_LIST)
 
     def get_sector_mapping(self) -> Dict[str, str]:
-        """Maps Ticker to Industry Sector (Production Metadata)."""
+        """Provides mapping of ticker symbols to industry sector categories."""
         mapping = {
             "HDFCBANK": "Financial Services", "ICICIBANK": "Financial Services",
-            "RELIANCE": "Oil & Gas", "TCS": "IT", "INFY": "IT", 
+            "RELIANCE": "Oil & Gas", "TCS": "IT", "INFY": "IT",
             "HINDUNILVR": "FMCG", "ITC": "FMCG", "BAJFINANCE": "Financial Services",
             "LT": "Construction", "AXISBANK": "Financial Services",
             "KOTAKBANK": "Financial Services", "SBIN": "Financial Services",
@@ -122,18 +131,22 @@ class UniverseManager:
         return mapping
 
     def get_benchmark_sector_weights(self) -> Dict[str, float]:
-        """Provides the NIFTY 200 benchmark sector weights for neutralization logic."""
+        """Provides default benchmark sector target weights for neutralization."""
         return {
             "Financial Services": 0.35, "IT": 0.15, "Oil & Gas": 0.12,
             "FMCG": 0.09, "Automobile": 0.06, "Healthcare": 0.05,
             "Construction": 0.04, "Telecom": 0.03, "Other / Midcap": 0.11
         }
 
+
+# ── Legacy Compatibility Helpers ──────────────────────────────────────────────
+
 def get_universe(date: Optional[pd.Timestamp] = None) -> List[str]:
-    """Legacy wrapper for backward compatibility."""
+    """Legacy helper function for backward compatibility."""
     mgr = UniverseManager()
     return mgr.get_universe(date)
 
+
 def get_yfinance_tickers(date: Optional[pd.Timestamp] = None, suffix: str = ".NS") -> List[str]:
-    """Returns universe tickers with the yfinance exchange suffix."""
+    """Legacy helper returning yfinance formatted ticker list."""
     return [f"{t}{suffix}" for t in get_universe(date)]

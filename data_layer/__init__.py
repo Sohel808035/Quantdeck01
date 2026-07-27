@@ -1,4 +1,41 @@
 """
-QuantDeck - Data Layer
-Handles data ingestion, raw storage, and providing clean datasets to the feature layer.
+QuantSphereX Data Layer Domain Module.
 """
+
+from data_layer.config import DataConfig
+from data_layer.interfaces import (
+    IDataCache,
+    IDataProvider,
+    IUniverseProvider,
+    ValidationReport,
+)
+from data_layer.storage import ParquetCache
+from data_layer.ingestor import (
+    MarketDataIngestor,
+    YFinanceIngestor,
+    MacroDataIngestor,
+    validate_panel,
+)
+from data_layer.universe import (
+    UniverseManager,
+    get_universe,
+    get_yfinance_tickers,
+    NIFTY200_STATIC_LIST,
+)
+
+__all__ = [
+    "DataConfig",
+    "IDataCache",
+    "IDataProvider",
+    "IUniverseProvider",
+    "ValidationReport",
+    "ParquetCache",
+    "MarketDataIngestor",
+    "YFinanceIngestor",
+    "MacroDataIngestor",
+    "validate_panel",
+    "UniverseManager",
+    "get_universe",
+    "get_yfinance_tickers",
+    "NIFTY200_STATIC_LIST",
+]
