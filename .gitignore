@@ -6,6 +6,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+quant_venv/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -33,6 +34,13 @@ pip-install-*/
 *.swp
 .DS_Store
 
-# Logs
+# Logs & Dumps
 logs/
 *.log
+current_run_output.txt
+final_results*.txt
+final_validation.txt
+run_log.txt
+run_results_*.txt
+turnover_test_*.txt
+
